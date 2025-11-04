@@ -1,0 +1,198 @@
+#include <Arduino.h>
+#include <LiquidCrystal.h>
+#include <Wire.h>
+#include <stdint.h>
+#include <SPI.h> 
+// #include <ESP32SPISlave.h> no nos funciono)
+
+
+
+// pantalla
+#define rs 25
+#define en 26
+#define d4 16
+#define d5 17
+#define d6 32
+#define d7 33
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+
+// LEDS
+#define LED1 13 // Rojo
+#define LED2 12 // Amarillo
+#define LED3 14 // Verde
+
+
+#define POT 4 
+
+// I2C ESCAVO
+#define I2C_DEV_ADDR 0x30 // Dirección I2C (7-bit)
+#define SDA_PIN 21        // Pin SDA I2C
+#define SCL_PIN 22        // Pin SCL I2C
+
+// SPI ESCLABO
+#define SPI_SCK 18   // PA5 (Nucleo SCK)
+#define SPI_MISO 19  // PA6 (Nucleo MISO)
+#define SPI_MOSI 23  // PA7 (Nucleo MOSI)
+#define SPI_CS 5     // pin CS de la Nucleo
+
+uint8_t ultimoLED = 0;
+uint16_t adcToSend = 0;
+int ultimoADC = 0;
+float ultimoVolt = 0.0;
+
+#define SPI_BUFFER_SIZE 32
+volatile char rx_spi_buffer[SPI_BUFFER_SIZE] = {0};
+volatile bool spi_transfer_ready = false;
+
+
+
+void ejecutarSPI(String cmd);
+void onRequest();
+void handleCS_Interrupt();
+void checkSPI_Polling();
+
+
+void setup() {
+  Serial.begin(115200);
+
+
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(LED3, OUTPUT);
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+  digitalWrite(LED3, LOW);
+
+  //Pantalla comfiguración
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("iniciando...");
+
+  // Esclavo I2C
+  Wire.begin((uint8_t)I2C_DEV_ADDR, SDA_PIN, SCL_PIN, 100000);
+  Wire.onRequest(onRequest);
+
+  // esclavo SPI
+  pinMode(SPI_CS, INPUT_PULLUP);
+  pinMode(SPI_MOSI, INPUT);
+  pinMode(SPI_SCK, INPUT);
+  pinMode(SPI_MISO, OUTPUT);
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SPI_CS);
+  attachInterrupt(digitalPinToInterrupt(SPI_CS), handleCS_Interrupt, CHANGE);
+
+  delay(1000);
+  lcd.clear();
+}
+
+void loop() {
+  // Leer el potenciómetro
+  int adcValor = analogRead(POT);          // 0 a 4095 
+  uint8_t adcEscalado = map(adcValor, 0, 4095, 0, 255); // Escalar a 0-255
+  float voltaje = (adcEscalado / 255.0f) * 3.3f;       // Voltaje de 3.3
+
+  // Guardar valores para SPI/I2C
+  ultimoVolt = voltaje;
+  ultimoADC = adcEscalado;
+  adcToSend = adcEscalado;
+
+  // Monitorear recepción SPI
+  checkSPI_Polling();
+
+  // Mostrar en LCD
+  lcd.setCursor(0, 0);
+  lcd.print("V:");
+  lcd.print(ultimoVolt, 2);
+  lcd.print(" pot1:");
+  lcd.print(ultimoADC);
+  lcd.print("                "); //limpiar
+
+  lcd.setCursor(0, 1);
+  lcd.print("LED:");
+  lcd.setCursor(4, 1);
+  switch (ultimoLED) {
+    case 1: lcd.print("R"); break; //rojo
+    case 2: lcd.print("A"); break; //amarillo
+    case 3: lcd.print("V"); break; //verde
+    default: lcd.print("N/A "); break; // cuando no haya nada osea la primera vez
+  }
+
+  delay(300);
+}
+
+/* #########################################################
+ Comunicación y control
+######################################################### */
+
+// Esclavo del I2C manda al maestro los datos (pantalla)
+void onRequest() {
+  Wire.write((uint8_t*)&adcToSend, sizeof(adcToSend));
+  Serial.println("mandado");
+
+}
+
+// SPI INTERRUPCION CS
+void IRAM_ATTR handleCS_Interrupt() {
+  if (digitalRead(SPI_CS) == LOW) {
+    spi_transfer_ready = true;
+  }
+}
+
+// SPI
+void checkSPI_Polling() {
+  if (spi_transfer_ready) {
+    spi_transfer_ready = false;
+
+    memset((void*)rx_spi_buffer, 0, SPI_BUFFER_SIZE);
+    int i = 0;
+    while (digitalRead(SPI_CS) == LOW && i < SPI_BUFFER_SIZE - 1) {
+      rx_spi_buffer[i] = SPI.transfer(0);
+      if (rx_spi_buffer[i] == '\0') break;
+      i++;
+    }
+
+    String comandoSPI = String((char*)rx_spi_buffer);
+    comandoSPI.trim();
+
+    Serial.println("recibido"); //muestra en el monitor serial cuando recibe lo del nucleo
+
+    if (comandoSPI.length() > 0) {
+      ejecutarSPI(comandoSPI);
+    }
+  }
+}
+
+// Control de las leds
+
+void ejecutarSPI(String cmd) {
+  int coma = cmd.indexOf(','); //recibe y ve que sea una ',' si es otra cosa lo rechaza
+  if (coma == -1) return;
+
+  int led = cmd.substring(0, coma).toInt(); // ve si es 1, 2 o 3 osea las leds
+  int tiempo = cmd.substring(coma + 1).toInt(); // agarra el numero
+
+  // verificar y cambiar el "contador"
+  if (led < 1 || led > 3 || tiempo < 10) {
+    ultimoLED = 0;
+    return;
+  }
+
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+  digitalWrite(LED3, LOW);
+
+  switch (led) {
+    case 1: digitalWrite(LED1, HIGH); break;
+    case 2: digitalWrite(LED2, HIGH); break;
+    case 3: digitalWrite(LED3, HIGH); break;
+  }
+
+  ultimoLED = led; //guarda apra mostrar en la pantalla
+  delay(tiempo);
+
+  //para apagar las leds al final del comando del nucleo
+  digitalWrite(LED1, LOW);
+  digitalWrite(LED2, LOW);
+  digitalWrite(LED3, LOW);
+  ultimoLED = 0; // lo devuelve a 0 porque es como una variable bool pero solo guarda un numero y lo va cambiando
+}
